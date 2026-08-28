@@ -1,0 +1,19 @@
+# 模型权重:几百 MB,由 setup_windows.ps1 下载,不进仓库
+models/
+*.onnx
+*.tar.bz2
+
+# 运行时生成
+__pycache__/
+*.pyc
+.venv/
+llama-bin/
+llm-models/
+
+# 录音和抓下来的音频片段:体积大,而且是现场数据
+*.wav
+captured*/
+
+# 编辑器
+*.code-workspace
+.DS_Store
