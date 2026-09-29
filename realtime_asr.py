@@ -13,8 +13,15 @@ Windows 版。整条链路:
 唤醒词吃的是未降噪的音频 —— GTCRN 会把弱语音当噪声削掉,对只有 3.3 M 参数的
 KWS 是致命的;而 VAD 那一路恰恰离不开降噪。两边要的东西相反,所以在 AGC 之后分叉。
 
-唤醒词(--wake,见 wakeword.py)是可选的一道闸:没听到"你好小智"之前,后面
+唤醒词(--wake,见 wakeword.py)是一道闸:没听到"你好小智"之前,后面
 整条链路都不动,只有 3.3 MB 的 KWS 模型在跑,待机 CPU 能降一个数量级。
+
+唤醒状态机的规矩(安全相关,改之前先看这里):
+    未唤醒   KWS 只认唤醒词。"处理好了""全部解除"这些命令词一律当环境音,
+             不进命令缓冲 —— 否则报警刚响时旁边一句闲聊就能把报警撤掉
+    唤醒后   才开命令词 KWS / ASR 命令匹配;唤醒词之前说的话不算
+    优先级   唤醒词 > 命令词。醒着时再喊一声唤醒词 = 重新开始,之前半句作废
+    报警     不自动打开闸门(--alert-wake 可以恢复旧行为)
 
 识别模型不是逐采样点输出的流式模型,所以这里做的是"低延迟分块识别":
 用 VAD 把麦克风音频切成一句一句,说话中每隔 ~1.2 秒出一次临时结果(灰色,
@@ -31,8 +38,8 @@ KWS 是致命的;而 VAD 那一路恰恰离不开降噪。两边要的东西相�
     .venv\\Scripts\\python.exe realtime_asr.py --no-partial         # 只要定稿结果,省一半算力
     .venv\\Scripts\\python.exe realtime_asr.py --denoise            # 噪声环境:GTCRN 降噪后再识别
     .venv\\Scripts\\python.exe realtime_asr.py --chat               # 识别 + LLM 回答(语音助手)
-    .venv\\Scripts\\python.exe realtime_asr.py --wake               # 唤醒词:说"你好小智"之前不跑识别(默认关)
-    .venv\\Scripts\\python.exe realtime_asr.py --wake --chat --speak       # 待机省 CPU 的语音助手
+    .venv\\Scripts\\python.exe realtime_asr.py --no-wake            # 关掉唤醒词(不推荐:命令词会一直开着)
+    .venv\\Scripts\\python.exe realtime_asr.py --chat --speak              # 待机省 CPU 的语音助手
     .venv\\Scripts\\python.exe realtime_asr.py --denoise --chat --speak    # 全语音对话
     .venv\\Scripts\\python.exe realtime_asr.py --speak --voice zm_yunxi    # 不开对话,直接朗读识别结果
     .venv\\Scripts\\python.exe realtime_asr.py --chat-url http://192.168.1.10:8080/v1 --chat
@@ -47,9 +54,8 @@ KWS 是致命的;而 VAD 那一路恰恰离不开降噪。两边要的东西相�
     R 键    全部解除
     直接问  "现在温度和速度是多少""今天完成了多少个包装" —— 用真实状态回答,不经 LLM
 
-唤醒词默认是**关**的:开口就能问,不用先喊"你好小智"。代价是麦克风一直在解 ——
-安静车间里一天下来多花的 CPU 有限,但如果现场一直有人说话、或者机器要长时间待机,
-就加 --wake 把闸门装回去(报警之后闸门会自动打开,不影响接着追问)。
+唤醒词默认是**开**的:先喊"你好小智"(或者按回车)再说命令。报警响了也一样要先叫醒 ——
+这正是为了挡住旁边人一句"处理好了"把报警误解除。--no-wake 可以关掉,但命令词会一直开着。
 
 Ctrl-C 退出。
 """
@@ -71,6 +77,7 @@ import gain
 import hotkey
 import intent as intent_mod
 import machine as machine_mod
+import manual as manual_mod
 import vad as vad_mod
 import wakeword
 import winutil
@@ -85,13 +92,19 @@ MODELS_DIR = HERE / "models"  # setup_windows.ps1 把模型都放这儿
 # 0.1 秒的块粒度),而中文第一个字的声母往往就那么几十毫秒。留短了的表现是
 # "打开电灯"识别成"开电灯" —— 命令词匹配那边能捞回来,但不如一开始就别丢。
 PRE_ROLL_SECONDS = 0.5
-MIN_DECODE_SECONDS = 1.0  # 模型对 <1s 的音频不稳定,不足则补零
+MIN_DECODE_SECONDS = 1.0
+# 反问"都处理好了吗"之后,多久没等到应答就当他没回答(秒)
+CONFIRM_TIMEOUT = 30.0  # 模型对 <1s 的音频不稳定,不足则补零
 
 # 触发阈值 = 底噪 x 3,但夹在这两个值之间:
 # 下限防止安静房间里一点风扇声就误触发;上限保证正常音量的说话一定能触发
 # (否则一开口就有声音时,底噪估计会被说话声本身抬高,阈值跟着涨到永远触发不了)。
 THRESHOLD_MIN = 0.006
 THRESHOLD_MAX = 0.05
+
+# 唤醒词文案和应答词,给提示语和 text 模式那条路用。main() 按参数填进去
+WAKE_HINT = ["你好小智"]
+WAKE_REPLY = ["你好，我在"]
 
 CLEAR_LINE = "\r\033[2K"
 DIM = "\033[2m"
@@ -420,6 +433,10 @@ def decoder_loop(
     text_gate=None,
     matcher=None,
     machine=None,
+    wake=None,
+    wake_once: bool = False,
+    manual=None,
+    wake_text=None,
 ) -> None:
     lock = print_lock or threading.Lock()
 
@@ -428,6 +445,25 @@ def decoder_loop(
         with lock:
             sys.stdout.write(s)
             sys.stdout.flush()
+
+    # 反问"都处理好了吗"之后,等工人那一声应答。存成一元列表是为了在闭包里改它
+    awaiting_confirm = [0.0]
+
+    def sleep_gates() -> None:
+        """一句唤醒对应一条指令:这条处理完就睡回去,不等 --wake-timeout。
+
+        车间里这样更稳 —— 醒着的每一秒,旁边的说话都可能被当成命令;
+        而且"下一句还是不是说给助手听的"只有用户自己知道,不该由超时来猜。
+        """
+        if not wake_once:
+            return
+        slept = False
+        for gate in (wake, text_gate):
+            if gate is not None and gate.awake:
+                gate.sleep()
+                slept = True
+        if slept:
+            emit(f"{DIM}[睡眠] 这条处理完了。再叫一声「{WAKE_HINT[0]}」或者按回车{RESET}\n")
 
     last_final_seg = -1
     while True:
@@ -470,8 +506,61 @@ def decoder_loop(
                     emit(f"{DIM}[存盘] {name}{RESET}\n")
                 except Exception as exc:  # 存盘失败不该影响识别本身
                     emit(f"{DIM}[存盘失败] {exc}{RESET}\n")
+            # 先过唤醒闸门,再认命令 —— 顺序不能反。
+            #
+            # 原来是先把整句替换成命令词、再拿去找唤醒词:"你好小智,处理好了"被
+            # 换成"处理好了"之后唤醒词就没了,text 模式根本叫不醒;而"处理好了,
+            # 你好小智"这种唤醒词**前面**的命令反倒跟着执行了。
+            # 现在的规矩:没醒 → 整句只当环境音;唤醒词之前的话一律不算,
+            # 命令只从唤醒词后面那部分里找。
             command = text
-            if kws_cmds or (matcher is not None and text):
+            passed = True
+            if text_gate is not None and text:
+                was_awake = text_gate.awake
+                passed, command = text_gate.feed_text(text)
+                if not passed:
+                    # 没唤醒:这句只当环境音,识别结果照样打出来,但不惊动 LLM 和 TTS
+                    emit(f"{DIM}(未唤醒,忽略){RESET}\n")
+                elif not was_awake:
+                    emit(f"{DIM}[唤醒] {WAKE_REPLY[0]},请说{RESET}\n")
+                    if speaker is not None and not command:
+                        speaker.interrupt()
+                        speaker.say(WAKE_REPLY[0])
+                if not passed or not was_awake:
+                    # 这一句是睡着时开始说的,KWS 听到的命令分不清在唤醒词前还是后,
+                    # 宁可不要(segment_loop 那边睡着时本来就不喂命令 KWS,这里是兜底)
+                    kws_cmds = []
+            elif text_gate is not None:
+                passed = text_gate.awake  # ASR 没出字,只剩 KWS 的命令:没醒就不认
+
+            # 醒着的时候又喊了一遍唤醒词:照样应答,别把它当成一条命令。
+            #
+            # kws 模式下 segment_loop 醒着时也在听唤醒词,听到就把那半句扔了;
+            # 这里接的是它漏掉、但 ASR 认出来的那几次。唤醒词优先:
+            # 它前面的话(包括 KWS 听到的命令)作废,只留后面的。
+            if passed and wake_text is not None and command:
+                hit, rest = wake_text.detector.match(command)
+                if hit:
+                    kws_cmds = []
+                    for gate in (wake, text_gate):
+                        # 又叫了一声说明人还在,把超时重新计时,别马上睡回去
+                        if gate is not None:
+                            gate.awake = True
+                            if hasattr(gate, "idle"):
+                                gate.idle = 0.0
+                            if hasattr(gate, "_last"):
+                                gate._last = time.time()
+                    if not rest.strip():
+                        emit(f"{CLEAR_LINE}{DIM}[唤醒] {WAKE_REPLY[0]},请说{RESET}\n")
+                        if speaker is not None and WAKE_REPLY[0]:
+                            speaker.interrupt()
+                            speaker.say(WAKE_REPLY[0])
+                        continue
+                    command = rest
+
+            if not passed:
+                command = ""
+            elif kws_cmds or (matcher is not None and command):
                 # 两条路各有各的强项,合并而不是二选一:
                 #   ASR + 拼音匹配   噪声小时更全 —— 它看得到整句,一句里说了
                 #                    几条命令都能切出来
@@ -479,52 +568,61 @@ def decoder_loop(
                 #                    ASR 那条 0/2、这条 2/2
                 # 早期版本是"有 KWS 就不看 ASR",结果在噪声不大的段落里反而丢命令:
                 # ASR 明明听全了两条,却被只听到一条的 KWS 覆盖掉。
-                asr_cmds = [h.command.text for h in matcher.match_all(text)] if (
-                    matcher is not None and text) else []
+                heard = command  # 唤醒词后面那部分;没装闸门就是整句
+                asr_cmds = [h.command.text for h in matcher.match_all(heard)] if (
+                    matcher is not None and heard) else []
                 merged = list(asr_cmds)
                 for c in kws_cmds:  # KWS 多听到的补进去,顺序放在后面
                     if c not in merged:
                         merged.append(c)
                 if merged:
                     command = "，".join(merged)
-                    if command != text:
+                    if command != heard:
                         src = []
                         if asr_cmds:
-                            src.append(f"ASR「{text}」")
+                            src.append(f"ASR「{heard}」")
                         if kws_cmds:
                             src.append(f"KWS{kws_cmds}")
                         emit(f"{DIM}[命令] {command}   ← {' + '.join(src)}{RESET}\n")
-                    text = command
                     if transcript:
                         transcript[-1] = command
                     else:
                         transcript.append(command)
-            if text_gate is not None and text:
-                was_awake = text_gate.awake
-                ok, command = text_gate.feed_text(text)
-                if not ok:
-                    # 没唤醒:这句只当环境音,识别结果照样打出来,但不惊动 LLM 和 TTS
-                    emit(f"{DIM}(未唤醒,忽略){RESET}\n")
-                elif not was_awake:
-                    emit(f"{DIM}[唤醒] 我在,请说{RESET}\n")
-                    if speaker is not None and not command:
-                        speaker.interrupt()
-                        speaker.say("我在")
+
             # 报警挂着的时候,先看这句是不是"故障处理好了"。工人手上正忙着
             # (在上料、在掏传送带),回来按键不现实,说一句就该把报警撤掉。
             # 排在状态问答前面:"料加好了"里也有"料"字,别被当成问产量
-            cleared = machine_mod.voice_clear(command, machine) if (
-                machine is not None and command) else None
-            if cleared is not None:
-                emit(f"{CLEAR_LINE}[解除] {cleared.title}: {cleared.cleared}   "
-                     f"{DIM}← 语音「{command}」{RESET}\n")
+            res = machine_mod.voice_clear(
+                command, machine, confirming=bool(awaiting_confirm[0])
+            ) if (machine is not None and command) else None
+            if res is not None and res.ask:
+                # 挂着好几条,工人只说了句笼统的"处理好了" —— 先问清楚。
+                # 直接全清太危险(可能他只修了一条),逼他一条条念又太烦
+                q = machine_mod.confirm_question(res.ask)
+                awaiting_confirm[0] = time.time()
+                emit(f"{CLEAR_LINE}[确认] {q}   {DIM}← 语音「{command}」{RESET}\n")
+                if speaker is not None:
+                    speaker.interrupt()
+                    speaker.say(q)
+                if chat is not None:
+                    chat.note(command, q)
+                continue
+            if res is not None and res.cleared:
+                awaiting_confirm[0] = 0.0
+                speech = machine_mod.cleared_speech(res.cleared)
+                names = "、".join(a.title for a in res.cleared)
+                emit(f"{CLEAR_LINE}[解除] {names}   {DIM}← 语音「{command}」{RESET}\n")
                 emit(f"{DIM}       {machine.status_text()}{RESET}\n")
                 if speaker is not None:
                     speaker.interrupt()
-                    speaker.say(cleared.cleared)
+                    speaker.say(speech)
                 if chat is not None:
-                    chat.note(command, cleared.cleared)
+                    chat.note(command, speech)
+                sleep_gates()
                 continue
+            # 没接住这句就把"等确认"撤掉 —— 工人已经说别的了
+            if awaiting_confirm[0] and time.time() - awaiting_confirm[0] > CONFIRM_TIMEOUT:
+                awaiting_confirm[0] = 0.0
 
             # 问设备状态的先在本地答掉,不进 LLM:答案是温度/产量这些真实数字,
             # 让模型转述只会多一道出错的机会,而且省掉一整轮生成(快一两秒)。
@@ -547,11 +645,23 @@ def decoder_loop(
                     # “那正常吗”“还能撑多久”这类追问
                     chat.note(command, status)
             elif chat is not None and command:
-                chat.submit(command)
+                # 手册问答:先去手册里找。找到了就把那几段连同页码交给 LLM,
+                # 并且约束它"只依据手册、要报页码、没写就说没写" ——
+                # 设备手册答错比答不出来危险得多,工人真会照着做。
+                # 找不到(BM25 分数够不着)就当普通问题,该聊什么聊什么。
+                ctx, pages = manual.context(command) if manual is not None else ("", [])
+                if ctx:
+                    emit(f"{DIM}[手册] 命中第 {'、'.join(str(p) for p in pages)} 页,"
+                         f"按手册内容回答{RESET}\n")
+                    # 200 token 够说 40 个字加页码;闲聊那条路仍然是 --chat-max-tokens
+                    chat.submit(command, manual_mod.system_prompt(ctx), max_tokens=200)
+                else:
+                    chat.submit(command)
             elif speaker is not None and command:
                 # 没开 --chat 时 --speak 就是复读机:用来单独验证 TTS 和回声闸门
                 speaker.interrupt()
                 speaker.say(command)
+            sleep_gates()
             if show_mem:
                 head = f"第 {seg_id} 句 {len(audio) / MODEL_SAMPLE_RATE:.1f}s"
                 body = f"工作集 {gb(winutil.rss_now())} / 峰值 {gb(winutil.rss_peak())}"
@@ -607,6 +717,33 @@ def segment_loop(
 
     seg_cmds: list[str] = []
 
+    def gate_open() -> bool:
+        """现在能不能接命令。没装唤醒闸门就一直能;装了就看醒没醒。"""
+        if wake is not None:
+            return wake.awake
+        if text_gate is not None:
+            return text_gate.awake
+        return True
+
+    was_open = gate_open()
+
+    def drop_pending() -> None:
+        """闸门一开一关,都把这之前攒的东西全扔掉:半句话、命令 KWS 听到的词、
+        命令 KWS 解了一半的解码状态。
+
+        睡着时听到的任何一个字都不许带进醒来之后 —— 原来就是这里漏的:
+        报警刚响,旁边有人说"处理好了",命令 KWS 记下了;随后有人喊"你好小智",
+        醒来后第一句的定稿把那条"处理好了"一起捎上,报警被没人确认过的话解除了。
+        """
+        nonlocal speech, in_speech, speech_dur, silence_dur, last_partial_dur
+        pre_roll.clear()
+        speech = []
+        in_speech = False
+        speech_dur = silence_dur = last_partial_dur = 0.0
+        seg_cmds.clear()
+        if cmd_kws is not None:
+            cmd_kws.reset()
+
     def flush() -> None:
         nonlocal seg_id, in_speech, speech, speech_dur, silence_dur, last_partial_dur
         audio = resample_to_model_rate(np.concatenate(speech), sr)
@@ -633,16 +770,12 @@ def segment_loop(
             speech_dur = silence_dur = last_partial_dur = 0.0
             continue
 
-        # 命令词也交给 KWS 直接从音频听 —— 不经过 ASR。实测同一段混音:
-        # 信噪比 5 dB 时 SenseVoice 只剩"小打开关闭",两条命令一条都对不上;
-        # KWS 两条全中。ASR 要在几千个字里解出"你说了什么",KWS 只要回答
-        # "有没有出现这几个词",搜索空间小几个数量级,噪声里剩下那点证据就够用。
-        # 喂未降噪的音频,理由和唤醒词一样(见上面 dn_stream 的注释)。
-        if cmd_kws is not None:
-            hit = cmd_kws.accept(raw_block)
-            if hit:
-                seg_cmds.append(hit)
-                emit(f"{CLEAR_LINE}{DIM}[命令·KWS] {hit}{RESET}\n")
+        # 闸门可能被别的线程开关:回车 / 报警(wake_now)、一条指令处理完睡回去
+        # (sleep_gates)。不管谁动的,状态一变就清场,见 drop_pending
+        now_open = gate_open()
+        if now_open != was_open:
+            drop_pending()
+            was_open = now_open
 
         # 有没有人在说话。silero 看频谱结构,energy 比能量 —— 见 vad.py。
         # 睡眠期间照样判:energy 那条路要靠它维护底噪估计,不然醒来第一块拿到的是
@@ -654,22 +787,44 @@ def segment_loop(
         noise = getattr(vad, "noise", None)
         threshold = getattr(vad, "threshold", 0.0)
 
-        if wake is not None and not wake.awake:
-            # 睡眠状态:只有 3.3 MB 的 KWS 模型在跑,SenseVoice 一次都不解。
-            # 这就是省 CPU 的地方 —— 没人叫它的时候,整条识别链路是停的。
+        if wake is not None:
+            # 唤醒词 KWS 睡着醒着都听,而且排在命令词前面:唤醒词优先级最高。
+            #   睡着  只有 3.3 MB 的 KWS 模型在跑,SenseVoice 一次都不解,命令 KWS 也不喂
+            #   醒着  又喊了一声 = 重新开始,之前半句话和听到的命令全作废
+            #         ("处理好了……不对,你好小智,把温度报一下"只执行后半句)
+            # 醒着多喂这一路 RTF 才 0.012,换来的是唤醒词永远压得住命令词。
+            was_awake = wake.awake
             hit = wake.feed(raw_block)  # 未降噪的那一份,见上面 dn_stream 的注释
             if not hit:
+                if not was_awake:
+                    continue
+            else:
+                tag = "唤醒" if not was_awake else "重新唤醒"
+                emit(f"{CLEAR_LINE}{DIM}[{tag}]「{hit}」{WAKE_REPLY[0]},请说{RESET}\n")
+                # 预滚里装的是唤醒词本身,留着会被识别成命令的一部分;
+                # 命令 KWS 从这一刻起才开始听,别让它带着唤醒词之前的解码状态
+                drop_pending()
+                was_open = True
+                if speaker is not None and args.wake_reply:
+                    speaker.interrupt()
+                    speaker.say(args.wake_reply)
                 continue
-            emit(f"{CLEAR_LINE}{DIM}[唤醒]「{hit}」我在,请说{RESET}\n")
-            # 预滚里装的是唤醒词本身,留着会被识别成命令的一部分
-            pre_roll.clear()
-            speech = []
-            in_speech = False
-            speech_dur = silence_dur = last_partial_dur = 0.0
-            if speaker is not None and args.wake_reply:
-                speaker.interrupt()
-                speaker.say(args.wake_reply)
-            continue
+
+        # 命令词也交给 KWS 直接从音频听 —— 不经过 ASR。实测同一段混音:
+        # 信噪比 5 dB 时 SenseVoice 只剩"小打开关闭",两条命令一条都对不上;
+        # KWS 两条全中。ASR 要在几千个字里解出"你说了什么",KWS 只要回答
+        # "有没有出现这几个词",搜索空间小几个数量级,噪声里剩下那点证据就够用。
+        # 喂未降噪的音频,理由和唤醒词一样(见上面 dn_stream 的注释)。
+        #
+        # 只在醒着时听。睡着时"处理好了""全部解除"就是普通的环境说话,
+        # 不进命令缓冲 —— 否则旁边一句闲聊就能把报警撤掉。
+        # text 模式下这也意味着:喊醒它的那一句里的命令词 KWS 不算,
+        # 要等下一句(那一句里 ASR 切出来的唤醒词之后的部分照样算)。
+        if cmd_kws is not None and gate_open():
+            hit = cmd_kws.accept(raw_block)
+            if hit:
+                seg_cmds.append(hit)
+                emit(f"{CLEAR_LINE}{DIM}[命令·KWS] {hit}{RESET}\n")
 
         if wake is not None and wake.tick(voiced or in_speech):
             # 醒着但一直没人说话:睡回去,别让 ASR 白白挂在那儿等
@@ -998,11 +1153,11 @@ def main() -> int:
     p.add_argument(
         "--wake",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="开唤醒词:说「你好小智」之前不跑识别。省 CPU 的主力开关 —— "
         "睡眠时只有 3.3 MB 的 KWS 模型在跑,SenseVoice 完全停着。"
-        "默认关:设备场景里操作工是随时开口问的,先喊一遍唤醒词反而挡路;"
-        "长时间待机、或者环境里一直有人说话时再打开",
+        "车间里一直有人说话时尤其要开,否则旁边的闲聊也会进识别。"
+        "嫌叫醒麻烦就 --no-wake,或者按回车代替喊唤醒词",
     )
     p.add_argument(
         "--wake-word",
@@ -1041,6 +1196,14 @@ def main() -> int:
         help="唤醒词解码加分,和 ASR 热词一个意思",
     )
     p.add_argument(
+        "--wake-once",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="叫醒一次只接一条指令,处理完立刻睡回去。"
+        "关掉(--no-wake-once)就是连续对话:醒着的这段时间里可以一直说,"
+        "--wake-timeout 秒没人说话才睡",
+    )
+    p.add_argument(
         "--wake-timeout",
         type=float,
         default=15.0,
@@ -1048,8 +1211,15 @@ def main() -> int:
     )
     p.add_argument(
         "--wake-reply",
-        default="我在",
+        default="你好，我在",
         help="被唤醒时念一句应答(要 --speak)。设成空串就不出声",
+    )
+    p.add_argument(
+        "--alert-wake",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="设备报警时自动打开唤醒闸门,不用喊唤醒词就能接着说。默认关:"
+        "报警刚响时旁边一句「处理好了」就会把报警误解除",
     )
     p.add_argument(
         "--wake-energy-gate",
@@ -1106,6 +1276,14 @@ def main() -> int:
         type=float,
         default=intent_mod.DEFAULT_THRESHOLD,
         help="命令词匹配阈值(归一化编辑距离)。调大更容易命中但会误匹配",
+    )
+    p.add_argument(
+        "--manual",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="设备手册问答:问到手册里写着的事(横封不牢、报警含义、参数参考值),"
+        "就检索手册内容让 LLM 照着答,并报出页码。"
+        "要先入库一次:manual.py --build。见 manual.py",
     )
     p.add_argument(
         "--machine",
@@ -1348,6 +1526,30 @@ def main() -> int:
         except RuntimeError as exc:
             degrade("唤醒词", str(exc).splitlines()[0])
 
+    if args.wake and wake is None and text_gate is None and args.wake_mode == "kws":
+        # KWS 唤醒没起来,不能就这么变成"没有闸门":那样命令词一直开着,
+        # 睡眠状态禁止执行命令的规矩整个失效。退到 text 模式,至少闸门还在
+        try:
+            text_gate = wakeword.TextWakeGate(
+                wakeword.TextWakeWord(args.wake_word), timeout=args.wake_timeout
+            )
+            print(f"唤醒词退回 text 模式: {text_gate.detector.describe()}")
+            wake_label = f"{'、'.join(args.wake_word)}(text,KWS 没起来)"
+        except RuntimeError as exc:
+            degrade("唤醒词(text 兜底)", str(exc).splitlines()[0])
+    if not args.wake or (wake is None and text_gate is None):
+        print(f"{DIM}[!] 没有唤醒闸门:命令词一直在听,旁边的闲聊也可能被当成命令执行{RESET}")
+
+    # 醒着时再喊唤醒词也要能认出来 —— 这一路只看文字,不占 CPU
+    wake_text = text_gate
+    if wake_text is None and (args.wake or text_gate is not None):
+        try:
+            wake_text = wakeword.TextWakeGate(
+                wakeword.TextWakeWord(args.wake_word), timeout=args.wake_timeout
+            )
+        except RuntimeError:
+            wake_text = None  # 没装 pypinyin 就算了,KWS 那一路照常
+
     cmd_kws = None
     if args.command_kws:
         kws_dir = args.wake_model or env.get("SHERPA_KWS_DIR")
@@ -1377,6 +1579,15 @@ def main() -> int:
         if cmd_kws is not None:
             print(f"命令 KWS 就绪,用时 {time.time() - t0:.1f}s")
             print(f"  {cmd_kws.describe()}")
+
+    manual = None
+    if args.manual:
+        try:
+            manual = manual_mod.Manual()
+            print(f"{manual.describe()}")
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            # 手册没入库不该拦住整条语音链路 —— 其余功能一样能用
+            degrade("手册问答", str(exc).splitlines()[0])
 
     machine = machine_mod.Machine() if args.machine else None
     if machine is not None:
@@ -1478,8 +1689,13 @@ def main() -> int:
           f"唤醒: {wake_label} | "
           f"对话: {chat_label} | "
           f"朗读: {speaker.voice if speaker else '关'}\n")
-    if wake is not None:
-        print(f"{DIM}现在是睡眠状态,识别不工作。说一声「{args.wake_word[0]}」再讲话。{RESET}")
+    WAKE_HINT[0] = args.wake_word[0]
+    WAKE_REPLY[0] = args.wake_reply
+    if wake is not None or text_gate is not None:
+        once = "叫醒一次接一条指令,答完自动睡回去" if args.wake_once else \
+               f"叫醒后 {args.wake_timeout:.0f}s 内可以连续说"
+        print(f"{DIM}现在是睡眠状态,识别不工作。说一声「{args.wake_word[0]}」"
+              f"或者按回车叫醒 —— {once}。{RESET}")
 
     # 模拟模式下音频是从文件喂的,闸掉也没用(文件不会等你),只在真麦克风上做
     mic_gate = speaker if (speaker and args.simulate is None and not args.no_mic_gate) else None
@@ -1517,14 +1733,50 @@ def main() -> int:
             text_gate,
             matcher,
             machine,
+            wake,
+            args.wake_once and args.wake,
+            manual,
+            wake_text,
         ),
         daemon=True,
     )
     worker.start()
 
+    if speaker is not None and args.wake_reply:
+        # 应答词是写死的一句,必须叫一声就立刻答 —— 现合要等,预合成不用
+        speaker.precache([args.wake_reply])
+
     if speaker is not None and args.chat and args.chat_filler:
         # 应答词必须命中缓存才有意义:现合成的话它自己就要等五秒
         speaker.precache(args.chat_filler)
+
+    raise_alert = clear_alert = None  # machine 关掉时这两个键就没有动作
+
+    def wake_now(reply: bool = True) -> bool:
+        """把唤醒闸门打开,等同于喊一声唤醒词。回车键和报警都走这里。
+
+        返回是否真的把它从睡眠里叫醒了(本来就醒着返回 False)。
+        """
+        woke = False
+        for gate in (wake, text_gate):
+            if gate is None or gate.awake:
+                continue
+            gate.awake = True
+            # 两种闸门的超时基准不一样:kws 按音频块累加(idle),
+            # text 按墙上时钟(_last)。哪个有就清哪个
+            if hasattr(gate, "idle"):
+                gate.idle = 0.0
+            if hasattr(gate, "_last"):
+                gate._last = time.time()
+            woke = True
+        if woke and reply:
+            with print_lock:
+                sys.stdout.write(f"{CLEAR_LINE}{DIM}[唤醒] 回车,{args.wake_reply},请说{RESET}\n")
+                sys.stdout.flush()
+            if speaker is not None and args.wake_reply:
+                speaker.interrupt()
+                speaker.say(args.wake_reply)
+        return woke
 
     if machine is not None and speaker is not None:
         # 报警词和解除词是写死的句子,提前合成好放着 —— Kokoro 在这台机器上
@@ -1558,24 +1810,25 @@ def main() -> int:
                 speaker.say(alert.speech)
             if chat is not None:
                 chat.note("设备报警", alert.speech)
-            # 报警之后用户十有八九要接着问("怎么处理""还要多久"),
-            # 这时候还要求先喊一遍唤醒词就很别扭 —— 直接把闸门打开
-            for gate in (wake, text_gate):
-                if gate is not None and not gate.awake:
-                    gate.awake = True
-                    # 两种闸门的超时基准不一样:kws 按音频块累加(idle),
-                    # text 按墙上时钟(_last)。哪个有就清哪个
-                    if hasattr(gate, "idle"):
-                        gate.idle = 0.0
-                    if hasattr(gate, "_last"):
-                        gate._last = time.time()
+            # 报警**不**自动打开闸门。原来是开的(省得工人再喊一遍唤醒词),
+            # 可报警刚响的那几秒,正是旁边人最可能说"处理好了""没事了"的时候 ——
+            # 闸门一开,这句闲聊就直接把报警撤了。唤醒词多喊一声的代价远小于误解除。
+            # 演示时嫌麻烦可以 --alert-wake 恢复旧行为
+            if args.alert_wake:
+                wake_now(reply=False)
 
         def clear_alert(index: int | None = None) -> None:
-            # 解除也要出声:报警响过而没有收尾,操作工不知道该不该继续等
-            alert = machine.recover() if index is None else machine.clear(index)
+            # 解除也要出声:报警响过而没有收尾,操作工不知道该不该继续等。
+            # R 键是全部解除 —— 挂着几条就逐条点名,只说"全部解除"工人不知道
+            # 系统认的是不是他理解的那几条
+            gone = machine.clear_all() if index is None else \
+                   ([a] if (a := machine.clear(index)) else [])
+            alert = gone[0] if gone else None
+            speech = machine_mod.cleared_speech(gone)
             with print_lock:
-                if alert is not None:
-                    sys.stdout.write(f"{CLEAR_LINE}[解除] {alert.title}: {alert.cleared}\n")
+                if gone:
+                    names = "、".join(a.title for a in gone)
+                    sys.stdout.write(f"{CLEAR_LINE}[解除] {names}: {speech}\n")
                     sys.stdout.write(f"{DIM}       {machine.status_text()}{RESET}\n")
                 else:
                     # 没响的报警按了解除:只提示一下,不出声 ——
@@ -1583,40 +1836,57 @@ def main() -> int:
                     name = "任何报警" if index is None else machine_mod.ALERTS[index].title
                     sys.stdout.write(f"{CLEAR_LINE}{DIM}[解除] 当前没有{name},忽略{RESET}\n")
                 sys.stdout.flush()
-            if alert is None:
+            if not gone:
                 return
             if speaker is not None:
                 speaker.interrupt()
-                speaker.say(alert.cleared)
+                speaker.say(speech)
             if chat is not None:
-                chat.note("故障已排除", alert.cleared)
+                chat.note("故障已排除", speech)
 
-        # 数字键分两段:前一半放报警,后一半解除对应的那一条。
-        # 两条报警就是 1/2 报警、3/4 解除;以后 ALERTS 加到三条,自动变成 1-3 和 4-6。
-        n_alerts = len(machine_mod.ALERTS)
+    # 信号键:手册里那 17 条(11 条停机报警 + 6 条质量故障)各占一个键。
+    #
+    # 原来是"1/2 触发、3/4 解除"两段分配,17 条之后不够分了 —— 数字只有 9 个。
+    # 现在按键只管**触发**:1-9 放前九条,a-h 放后八条;解除交给语音
+    # ("换膜了""横封调好了",每条信号自带说法)和 R 键(全部解除)。
+    # 现场本来也是这个分工:报警是设备发的,解除是人做完事之后说的。
+    SIGNAL_KEYS = "123456789abcdefgh"
+    n_alerts = len(machine_mod.ALERTS) if machine is not None else 0
 
-        def on_key(ch: str) -> None:
-            if ch == " ":
-                raise_alert()  # 按顺序循环,一路演下去
-            elif ch.isdigit() and 1 <= int(ch) <= n_alerts:
-                raise_alert(int(ch) - 1)  # 直选某一条报警,不用一路按过去
-            elif ch.isdigit() and n_alerts < int(ch) <= 2 * n_alerts:
-                clear_alert(int(ch) - n_alerts - 1)  # 解除对应的那一条
-            elif ch in ("r", "R"):
-                clear_alert()  # 全部解除
+    def on_key(ch: str) -> None:
+        if ch in ("\r", "\n"):
+            # 回车 = 喊一声唤醒词。噪声大、或者不想出声的时候用它,
+            # 走的和 KWS 检出完全同一条路
+            wake_now()
+        elif machine is None:
+            return  # 关了包装机场景,就只剩回车这一个键
+        elif ch == " ":
+            raise_alert()  # 按顺序循环,一路演下去
+        elif ch.lower() in SIGNAL_KEYS[:n_alerts]:
+            raise_alert(SIGNAL_KEYS.index(ch.lower()))  # 直选某一条,不用一路按过去
+        elif ch in ("r", "R"):
+            clear_alert()  # 全部解除
 
-        if hotkey.start(stop_event, on_key) is not None:
-            fire = " · ".join(
-                f"{i} = {a.title}" for i, a in enumerate(machine_mod.ALERTS, 1)
-            )
-            clear = " · ".join(
-                f"{i + n_alerts} = 解除{a.title}"
-                for i, a in enumerate(machine_mod.ALERTS, 1)
-            )
-            print(f"{DIM}演示热键: 空格 = 下一条报警(循环) · {fire}"
-                  f" · {clear} · R = 全部解除{RESET}")
-        else:
-            degrade("报警热键", "当前环境收不到按键(输出被重定向?),状态问答不受影响")
+    if hotkey.start(stop_event, on_key) is not None:
+        head = []
+        if wake is not None or text_gate is not None:
+            head.append("回车 = 唤醒")
+        if machine is not None:
+            head.append("空格 = 下一条")
+            head.append("R = 全部解除")
+            head.append("解除也可以直接说(「换膜了」「横封调好了」)")
+        if head:
+            print(f"{DIM}热键: {' · '.join(head)}{RESET}")
+        if machine is not None:
+            # 17 条一行一条太长,三条一行排开;停机的标「停」,不停机的标「质」
+            cells = [
+                f"{SIGNAL_KEYS[i]} {'停' if a.stops else '质'} {a.title}"
+                for i, a in enumerate(machine_mod.ALERTS[:len(SIGNAL_KEYS)])
+            ]
+            for row in range(0, len(cells), 3):
+                print(f"{DIM}   " + "".join(f"{c:<22}" for c in cells[row:row + 3]) + RESET)
+    else:
+        degrade("热键", "当前环境收不到按键(输出被重定向?),语音那条路不受影响")
 
     if args.simulate is None:
         blocks = mic_blocks(device, sr, stop_event)

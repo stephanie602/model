@@ -84,7 +84,8 @@ class HttpAssistant:
 
         self._session = requests.Session()
 
-    def _messages(self, user_text: str) -> list[dict[str, str]]:
+    def _messages(self, user_text: str,
+                  extra_system: str | None = None) -> list[dict[str, str]]:
         extra = ""
         if self.context is not None:
             try:
@@ -99,8 +100,20 @@ class HttpAssistant:
         # 0.39s 涨到 0.95s。挪到末尾,系统提示和历史都还在缓存里。
         msgs = [{"role": "system", "content": self.system}]
         msgs.extend(self.history)
-        content = f"{extra}\n{user_text}" if extra else user_text
-        msgs.append({"role": "user", "content": content})
+        # 顺序:系统提示 → 历史 → (本轮的手册内容) → 设备状态 + 用户这句话。
+        # 手册内容放在最后一条 system 里而不是塞进用户消息,是为了让模型分得清
+        # "这是资料"和"这是用户说的话" —— 混在一起它会把手册里的句子当成用户的要求
+        if extra_system:
+            msgs.append({"role": "system", "content": extra_system})
+        # 设备状态必须走 system,不能贴在用户那句话前面。
+        #
+        # 原来是 f"{状态}\n{用户说的话}" 一起塞进 user —— 4B 模型分不清哪半句是
+        # 用户说的,于是把状态原样背出来:实测 5 句里 4 句中招,问"你好"答
+        # "封口温度168度，速度42包/分钟，已完成3860包",问"今天天气不错"也一样。
+        # 换成独立的 system 消息,角色分清楚了;仍然放在最后,所以前缀缓存不受影响。
+        if extra:
+            msgs.append({"role": "system", "content": extra})
+        msgs.append({"role": "user", "content": user_text})
         return msgs
 
     def probe(self) -> str:
@@ -121,12 +134,19 @@ class HttpAssistant:
                 "  .\\start_llm.ps1"
             ) from exc
 
-    def reply_stream(self, user_text: str):
-        """逐段产出回答文本。调用方负责打印,这样能边生成边显示。"""
+    def reply_stream(self, user_text: str, extra_system: str | None = None,
+                     max_tokens: int | None = None):
+        """逐段产出回答文本。调用方负责打印,这样能边生成边显示。
+
+        extra_system 只对这一轮生效 —— 手册检索的结果走这里:它是"这个问题"
+        查到的内容,不该留在系统提示里影响下一个问题,也不该进对话历史
+        (历史里留的是问和答,不是当时翻到的手册页)。
+        """
         payload = {
             "model": self.model,
-            "messages": self._messages(user_text),
-            "max_tokens": self.max_tokens,
+            "messages": self._messages(user_text, extra_system),
+            # 手册问答那一轮要得比闲聊多:故障有好几条原因,额度不够会被截在半句
+            "max_tokens": max_tokens or self.max_tokens,
             # temperature=0:同一句话每次回答一致,调试和复现都方便
             "temperature": 0.0,
             "stream": True,
@@ -242,6 +262,8 @@ class ChatWorker:
         self._filler_i = 0
         self._cv = threading.Condition()
         self._pending: str | None = None
+        self._pending_extra: str | None = None  # 本轮的手册内容,见 submit()
+        self._pending_tokens: int | None = None
         self._closed = False
         # "正在生成回答"。麦克风闸门要看它 —— 见 tts.Speaker.blocking_mic():
         # 边生成边念时两句之间会有空档,光看"有没有在播"会漏。
@@ -271,12 +293,15 @@ class ChatWorker:
         with self._cv:
             return self._busy
 
-    def submit(self, text: str) -> None:
+    def submit(self, text: str, extra_system: str | None = None,
+               max_tokens: int | None = None) -> None:
         text = text.strip()
         if len(text) < self.min_chars:
             return  # 单字多半是噪声误触发,不值得叫模型
         with self._cv:
             self._pending = text
+            self._pending_extra = extra_system
+            self._pending_tokens = max_tokens
             self._cv.notify()
 
     def note(self, user_text: str, answer: str) -> None:
@@ -305,6 +330,8 @@ class ChatWorker:
                 if self._pending is None:
                     return
                 text, self._pending = self._pending, None
+                extra_system, self._pending_extra = self._pending_extra, None
+                turn_tokens, self._pending_tokens = self._pending_tokens, None
                 self._busy = True
 
             buf = None
@@ -351,7 +378,7 @@ class ChatWorker:
                     with self.print_lock:
                         sys.stdout.write(f"\r\033[2K{self.prefix}")
                         sys.stdout.flush()
-                for chunk in self.assistant.reply_stream(text):
+                for chunk in self.assistant.reply_stream(text, extra_system, turn_tokens):
                     if t_first_token is None:
                         t_first_token = time.time()
                     n_chars += len(chunk)

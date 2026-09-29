@@ -75,6 +75,13 @@ PLAY_SLICE_SECONDS = 0.05  # 播放按小片写,好让 interrupt() 能立刻掐�
 # 抢 CPU,而且在跑的那一条没法中断 —— 实测备货期间提问,"提问到出声"从
 # 0.00s 变成 1.77s。所以只在真闲下来的空当里备,用户一开口就停。
 PRECACHE_IDLE_SECONDS = 2.0
+# 停了多久之后,下一句开口前要先垫一小段静音(秒),以及垫多长。
+#
+# 数字输出(HDMI / S-PDIF)在没有数据时会失锁,声音重新开始时前一两百毫秒
+# 被吃掉 —— 表现就是"吞字",而且吞的总是每句话的开头。板子默认的输出设备
+# 正是 HDMI 音频,所以这一层是必须的。中途连着播不受影响(间隔远小于阈值)。
+IDLE_RESYNC_SECONDS = 0.4
+RESYNC_SILENCE_SECONDS = 0.15
 
 # 句末标点:见到就立刻送去合成。带上 ~ 和 ~ 是因为口语化的回答很爱用它们收尾
 _SENTENCE_END = "。！？!?；;…~～\n"
@@ -336,6 +343,7 @@ class Speaker:
         self.on_speak = None
         # 最近一次"有事发生"的时刻:说话、出声、被打断都算。备货看它决定该不该动
         self._last_activity = 0.0
+        self._last_write = 0.0      # 上一次往声卡写数据的时刻,见 IDLE_RESYNC_SECONDS
 
         self._synth_thread = threading.Thread(target=self._synth_loop, daemon=True)
         self._play_thread = threading.Thread(target=self._play_loop, daemon=True)
@@ -707,6 +715,17 @@ class Speaker:
                         dtype="float32",
                     )
                     self._stream.start()
+                    # 刚打开的输出流会吞掉第一个缓冲区 —— 表现是第一句话被削掉
+                    # 开头("你好,我在"只剩"在")。先灌 0.2 秒静音把流喂热
+                    self._stream.write(
+                        np.zeros(int(0.2 * self.sample_rate), dtype=np.float32)
+                    )
+                    self._last_write = time.time()
+                if time.time() - self._last_write > IDLE_RESYNC_SECONDS:
+                    # 隔了一会儿没出声:数字输出这段时间里已经失锁了,
+                    # 先垫一小段静音让它重新锁上,再放真内容
+                    self._stream.write(np.zeros(
+                        int(RESYNC_SILENCE_SECONDS * self.sample_rate), dtype=np.float32))
                 # 分小片写:阻塞式 write 一次性灌进去的话,interrupt() 得等整句播完才生效
                 step = max(1, int(PLAY_SLICE_SECONDS * self.sample_rate))
                 for start in range(0, len(audio), step):
@@ -714,6 +733,7 @@ class Speaker:
                         if gen != self._generation:
                             break
                     self._stream.write(audio[start : start + step])
+                self._last_write = time.time()
                 # write() 返回只代表数据进了输出缓冲,喇叭还要再响一个设备延迟。
                 # Windows 共享模式 WASAPI 上这个延迟通常 100-300 ms,而尾部保护
                 # 一共才 0.6 秒 —— 不把它算进去,等于自己吃掉一半保护时间,
